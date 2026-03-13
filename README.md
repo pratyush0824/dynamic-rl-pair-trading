@@ -20,12 +20,14 @@ The implementation focuses on:
 # Project Structure
 
 The repository contains the following Python modules:
+```
 agent_rl_advanced.py
 data_loading.py
 env_trading_advanced.py
 pair_spread_utils.py
 portfolio_manager.py
 results_analysis.py
+```
 
 ---
 
