@@ -3,12 +3,10 @@ import numpy as np
 import pandas as pd
 from gym import spaces
 
+from pair_spread_utils import compute_regression_spread, compute_zone
+
+
 class AdvancedPairTradingEnv(gym.Env):
-    """
-    Example environment with:
-      - trade_history stored in self.trade_history
-      - each step, we append the old_pos, new_pos, step_pnl, portfolio_value, etc.
-    """
 
     def __init__(
         self,
@@ -22,9 +20,13 @@ class AdvancedPairTradingEnv(gym.Env):
         funding_spread: float = 0.0,
         reward_scaling: float = 1e-4,
         max_episode_steps: int = 5000,
-        risk_stop: float = 0.3
+        risk_stop: float = 0.3,
+        open_threshold: float = 1.8,
+        close_threshold: float = 0.4
     ):
+
         super().__init__()
+
         self.df = df_merged.copy()
         self.pair_list = pair_list
         self.window_size = window_size
@@ -37,224 +39,234 @@ class AdvancedPairTradingEnv(gym.Env):
         self.max_episode_steps = max_episode_steps
         self.risk_stop = risk_stop
 
-        # 1) Build 'spread' columns => log(p_base) - log(p_quote)
+        self.open_threshold = open_threshold
+        self.close_threshold = close_threshold
+
         self.spread_cols = []
+        self.zscore_cols = []
+
+        # --- compute spreads using regression (paper definition)
+
         for pair in self.pair_list:
+
             base, quote = pair.split('-')
+
             col_base = f"close_{base}"
             col_quote = f"close_{quote}"
+
             spread_col = f"spread_{base}_{quote}"
-            self.df[spread_col] = np.log(self.df[col_base]) - np.log(self.df[col_quote])
-            self.spread_cols.append(spread_col)
 
-        # 2) rolling mean & std => zscore
-        for spread_col in self.spread_cols:
-            roll_mean = self.df[spread_col].rolling(self.window_size).mean()
-            roll_std = self.df[spread_col].rolling(self.window_size).std()
-            z_col = spread_col.replace('spread', 'zscore')
-            self.df[z_col] = (self.df[spread_col] - roll_mean) / (roll_std + 1e-8)
+            window_base = self.df[col_base].iloc[:self.window_size]
+            window_quote = self.df[col_quote].iloc[:self.window_size]
 
-        # 3) Drop NaN
-        self.df.dropna(inplace=True)
-        self.df.reset_index(drop=True, inplace=True)
-        if len(self.df) < self.window_size + 1:
-            raise ValueError(
-                f"Not enough data after rolling. Need > {self.window_size}, got {len(self.df)}."
+            _, beta0, beta1 = compute_regression_spread(
+                window_base,
+                window_quote
             )
 
-        # 4) Adjust max_episode_steps if needed
-        max_possible = (len(self.df) - self.window_size - 1) // self.step_size
-        if self.max_episode_steps is not None:
-            self.max_episode_steps = min(self.max_episode_steps, max_possible)
+            spread = self.df[col_base] - (beta0 + beta1 * self.df[col_quote])
 
-        # 5) Observations: zscore_i + position_i + portfolio_value_ratio
+            self.df[spread_col] = spread
+            self.spread_cols.append(spread_col)
+
+        # --- rolling zscore
+
+        for spread_col in self.spread_cols:
+
+            roll_mean = self.df[spread_col].rolling(self.window_size).mean()
+            roll_std = self.df[spread_col].rolling(self.window_size).std()
+
+            z_col = spread_col.replace("spread", "zscore")
+
+            self.df[z_col] = (self.df[spread_col] - roll_mean) / (roll_std + 1e-8)
+
+            self.zscore_cols.append(z_col)
+
+        self.df.dropna(inplace=True)
+        self.df.reset_index(drop=True, inplace=True)
+
         self.num_pairs = len(self.pair_list)
-        obs_dim = self.num_pairs * 2 + 1
+
+        obs_dim = self.num_pairs * 3 + 1
+
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+            low=-np.inf,
+            high=np.inf,
+            shape=(obs_dim,),
+            dtype=np.float32
         )
 
-        # 6) Action space: continuous in [-0.5, 0.5]
+        # Action space must be [-1,1] (paper)
+
         self.action_space = spaces.Box(
-            low=-0.5, high=0.5, shape=(self.num_pairs,), dtype=np.float32
+            low=-1.0,
+            high=1.0,
+            shape=(self.num_pairs,),
+            dtype=np.float32
         )
 
-        # Internals
-        self.current_idx = 0
-        self.step_counter = 0
-        self.done_flag = False
+        self.reset()
 
-        self.positions = np.zeros(self.num_pairs, dtype=np.float32)
-        self.last_positions = np.zeros_like(self.positions)
+    def reset(self, seed=None, options=None):
+
+        self.current_idx = self.window_size
+        self.step_counter = 0
+
+        self.positions = np.zeros(self.num_pairs)
         self.portfolio_value = self.initial_capital
+
         self.trades_count = 0
         self.time_in_market_steps = 0
 
-        # Logs
         self.equity_curve = []
         self.dates = []
 
-        # Pair-level equity tracking (optional)
-        self.equity_curve_per_pair = { pair: [] for pair in self.pair_list }
-        self.dates_per_pair = { pair: [] for pair in self.pair_list }
-
-        # **IMPORTANT**: We'll store trade records here
         self.trade_history = []
 
+        return self._get_obs(), {}
+
     def _get_current_row(self):
-        if self.current_idx >= len(self.df):
-            return self.df.iloc[-1]
+
         return self.df.iloc[self.current_idx]
 
     def _get_obs(self):
+
         row = self._get_current_row()
-        zscores = []
-        for pair in self.pair_list:
-            base, quote = pair.split('-')
-            z_col = f"zscore_{base}_{quote}"
-            zscores.append(row[z_col])
+
+        zscores = np.array([row[c] for c in self.zscore_cols])
+
+        zones = np.array([
+            compute_zone(z, self.open_threshold, self.close_threshold)
+            for z in zscores
+        ])
 
         obs = []
+
         obs.extend(zscores)
+        obs.extend(zones)
         obs.extend(self.positions)
+
         obs.append(self.portfolio_value / self.initial_capital)
+
         return np.array(obs, dtype=np.float32)
 
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        self.done_flag = False
-        self.current_idx = self.window_size
-        if self.current_idx >= len(self.df):
-            self.current_idx = len(self.df) - 1
-
-        self.step_counter = 0
-        self.positions = np.zeros(self.num_pairs, dtype=np.float32)
-        self.last_positions = np.zeros_like(self.positions)
-        self.portfolio_value = self.initial_capital
-        self.trades_count = 0
-        self.time_in_market_steps = 0
-
-        self.equity_curve = []
-        self.dates = []
-        self.equity_curve_per_pair = { pair: [] for pair in self.pair_list }
-        self.dates_per_pair = { pair: [] for pair in self.pair_list }
-
-        # Re-initialize the trade_history on each reset
-        self.trade_history = []
-
-        obs = self._get_obs()
-        info = {}
-        return obs, info
-
     def step(self, action):
-        action = np.clip(action, self.action_space.low, self.action_space.high)
 
-        # 1) PnL from old positions
-        step_pnl, pairwise_pnls = self._compute_pnl()
+        action = np.clip(action, -1, 1)
 
-        # 2) Transaction cost
-        pos_change = np.abs(action - self.positions).sum()
-        cost = pos_change * self.initial_capital * self.transaction_cost
-        step_pnl -= cost
+        row = self._get_current_row()
 
-        # 3) Funding cost
-        funding_cost = np.sum(np.abs(self.positions)) * self.initial_capital * self.funding_spread
-        step_pnl -= funding_cost
+        zscores = np.array([row[c] for c in self.zscore_cols])
 
-        # 4) Update portfolio
-        self.portfolio_value += step_pnl
+        zones = np.array([
+            compute_zone(z, self.open_threshold, self.close_threshold)
+            for z in zscores
+        ])
 
-        done = False
-        truncated = False
-        if self.portfolio_value <= (self.risk_stop * self.initial_capital):
-            # risk stop
-            step_pnl = self.risk_stop * self.initial_capital - self.portfolio_value
-            self.portfolio_value = self.risk_stop * self.initial_capital
-            done = True
-            truncated = True
+        prev_positions = self.positions.copy()
 
-        # 5) Count a trade if sum of position changes > 0.01
-        position_diff = np.sum(np.abs(action - self.positions))
-        if position_diff > 0.01:
-            self.trades_count += 1
+        # --- PnL from previous positions
 
-        row_now = self._get_current_row()
+        if self.current_idx + 1 < len(self.df):
+
+            next_row = self.df.iloc[self.current_idx + 1]
+
+            pnl = 0
+
+            for i, pair in enumerate(self.pair_list):
+
+                spread_col = self.spread_cols[i]
+
+                spread_now = row[spread_col]
+                spread_next = next_row[spread_col]
+
+                spread_return = spread_next - spread_now
+
+                if np.isfinite(spread_return):
+                    pnl += prev_positions[i] * spread_return
+
+        else:
+
+            pnl = 0
+
+        # --- adjust positions (paper: adjust not replace)
+
+        position_change = action - prev_positions
+
+        self.positions += position_change
+
+        self.positions = np.clip(self.positions, -1.0, 1.0)
+
+        transaction_cost = np.sum(np.abs(position_change)) * self.transaction_cost
+
+        pnl -= transaction_cost
+
+        self.portfolio_value += pnl
+
+        # --- reward components
+
+        portfolio_reward = pnl
+
+        transaction_penalty = np.sum(np.abs(position_change))
+
+        action_reward = 0
+
+        for z, a in zip(zones, action):
+
+            if z == 2 and a < 0:
+                action_reward += 1
+
+            if z == -2 and a > 0:
+                action_reward += 1
+
+            if z == 0 and abs(a) < 0.05:
+                action_reward += 1
+
+        reward = (
+                portfolio_reward
+                + 0.1 * action_reward
+                - 0.01 * transaction_penalty
+        )
+
+        reward *= self.reward_scaling
+
+        # --- bookkeeping
+
         self.equity_curve.append(self.portfolio_value)
-        self.dates.append(row_now["time"])
 
-        # pair-level partial PnL
-        if not hasattr(self, 'pair_values'):
-            self.pair_values = {p: self.initial_capital / len(self.pair_list) for p in self.pair_list}
+        if "time" in row:
+            self.dates.append(row["time"])
+        else:
+            self.dates.append(self.current_idx)
 
-        for i, pair in enumerate(self.pair_list):
-            self.pair_values[pair] += pairwise_pnls[i]
-            if self.pair_values[pair] < 0:
-                self.pair_values[pair] = 0
-            self.equity_curve_per_pair[pair].append(self.pair_values[pair])
-            self.dates_per_pair[pair].append(row_now["time"])
+        self.trade_history.append(
+            {
+                "step": self.step_counter,
+                "time": self.dates[-1],
+                "old_pos": prev_positions.tolist(),
+                "new_pos": self.positions.tolist(),
+                "step_pnl": pnl,
+                "portfolio_value": self.portfolio_value
+            }
+        )
 
-        # **HERE** we append the trade info
-        self.trade_history.append({
-            "step": self.step_counter,
-            "time": row_now["time"],
-            "old_pos": self.positions.copy(),
-            "new_pos": action.copy(),
-            "step_pnl": step_pnl,
-            "portfolio_value": self.portfolio_value
-        })
-
-        self.last_positions = self.positions.copy()
-        self.positions = action
-
-        scaled_reward = step_pnl * self.reward_scaling
+        if np.any(self.positions != 0):
+            self.time_in_market_steps += 1
 
         self.current_idx += self.step_size
         self.step_counter += 1
 
-        if not done:
-            if self.current_idx >= len(self.df) - 1:
-                done = True
-            elif self.step_counter >= self.max_episode_steps:
-                done = True
-                truncated = True
+        done = False
+
+        if self.current_idx >= len(self.df) - 1:
+            done = True
+
+        if self.portfolio_value < self.initial_capital * (1 - self.risk_stop):
+            done = True
+
+        if self.step_counter >= self.max_episode_steps:
+            done = True
 
         obs = self._get_obs()
-        info = {
-            "portfolio_value": self.portfolio_value,
-            "trades_count": self.trades_count
-        }
-        return obs, scaled_reward, done, truncated, info
 
-    def _compute_pnl(self):
-        if self.step_counter == 0:
-            return 0.0, [0.0]*self.num_pairs
-
-        row_now = self._get_current_row()
-        row_prev_idx = self.current_idx - self.step_size
-        if row_prev_idx < 0:
-            row_prev_idx = 0
-        row_prev = self.df.iloc[row_prev_idx]
-
-        total_pnl = 0.0
-        pairwise_pnls = []
-        for i, pair in enumerate(self.pair_list):
-            base, quote = pair.split('-')
-            spread_col = f"spread_{base}_{quote}"
-            spread_now = row_now[spread_col]
-            spread_prev = row_prev[spread_col]
-            spread_diff = spread_now - spread_prev
-
-            pos_frac = self.positions[i]
-            notional = self.initial_capital * abs(pos_frac)
-            direction = np.sign(pos_frac)
-            pair_pnl = notional * direction * spread_diff
-            total_pnl += pair_pnl
-            pairwise_pnls.append(pair_pnl)
-
-        return total_pnl, pairwise_pnls
-
-    def render(self, mode='human'):
-        print(f"Step: {self.step_counter}, "
-              f"Index: {self.current_idx}, "
-              f"Value: {self.portfolio_value:.2f}, "
-              f"Trades: {self.trades_count}")
+        return obs, reward, done, False, {}
